@@ -23,10 +23,12 @@ const FACE = { 11: "J", 12: "Q", 13: "K", 14: "A" };
 const rName = r => FACE[r] || String(r);
 const isRed = s => s === "♥" || s === "♦";
 
+// Card ids must be unique across BOTH players' decks: destruction removes
+// victims by id from both boards, so a shared id would smash your own card.
+let CARD_ID = 0;
 function makeDeck() {
   const d = [];
-  let id = 0;
-  for (const s of SUITS) for (let r = 2; r <= 14; r++) d.push({ r, s, id: id++ });
+  for (const s of SUITS) for (let r = 2; r <= 14; r++) d.push({ r, s, id: CARD_ID++ });
   for (let i = d.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [d[i], d[j]] = [d[j], d[i]];
@@ -66,9 +68,17 @@ function evalHand(cards) {
 
 const boardTotal = board => board.reduce((a, col) => a + evalHand(col).score, 0);
 
-// ─── DEALER AI ───────────────────────────────────────────
-// Greedy: own score gain + damage dealt, plus draw-potential bonuses,
-// with a little noise so it isn't perfectly predictable.
+// ─── DEALER AI: expectimax ───────────────────────────────
+// The dealer searches the game tree: it tries each placement, then averages
+// over every card the opponent could draw next (their real remaining deck),
+// assuming the opponent answers with its own best move, and so on to a fixed
+// depth. No randomness, so the house edge stays a fixed, measurable quantity.
+// Leaf positions are scored by a phase-aware evaluation (see leafEval): early
+// game it rewards live draws toward multipliers, late game it penalises exposed
+// stacks the opponent can still smash. No randomness, so the house edge stays a
+// fixed, measurable quantity.
+const AI_DEPTH = 3; // plies of lookahead (each ply = one card placed)
+
 function colPotential(col) {
   if (col.length !== 2) return 0;
   let b = 0;
@@ -79,20 +89,95 @@ function colPotential(col) {
   return b;
 }
 
-function aiChoose(g) {
-  const card = g.drawn;
-  let best = -1, bestVal = -Infinity;
+// Apply `card` to `boards[side][col]`, destroying same-rank cards in the
+// opponent's opposing column. Returns a fresh boards object.
+function applyPlace(boards, side, col, card) {
+  const opp = side === "a" ? "p" : "a";
+  const nb = { p: boards.p.map(c => c.slice()), a: boards.a.map(c => c.slice()) };
+  nb[side][col] = [...nb[side][col], card];
+  nb[opp][col] = nb[opp][col].filter(c => c.r !== card.r);
+  return nb;
+}
+
+const boardFull = (boards, side) => boards[side].every(c => c.length === 3);
+
+// Value lost if the opponent smashes a column's most damaging duplicate rank —
+// i.e. how much exposed multiplier value sits in that column.
+function smashRisk(col) {
+  if (col.length < 2) return 0;
+  const base = evalHand(col).score, cnt = {};
+  col.forEach(c => { cnt[c.r] = (cnt[c.r] || 0) + 1; });
+  let worst = 0;
+  for (const r in cnt) {
+    const loss = base - evalHand(col.filter(c => +c.r !== +r)).score;
+    if (loss > worst) worst = loss;
+  }
+  return worst;
+}
+
+// Value of a position from the dealer's ("a") perspective: positive = good for
+// the dealer. Phase-aware: early game rewards live draw potential; late game
+// penalises exposed multiplier value the opponent can still smash. A card sitting
+// opposite a FULL column is safe (can't be matched), so it incurs no risk.
+function leafEval(boards) {
+  let aS = 0, pS = 0, aP = 0, pP = 0, filled = 0;
   for (let c = 0; c < 3; c++) {
-    if (g.boards.a[c].length >= 3) continue;
-    const myBefore = g.boards.a[c];
-    const myAfter = [...myBefore, card];
-    const oppBefore = g.boards.p[c];
-    const oppAfter = oppBefore.filter(x => x.r !== card.r);
-    let val = (evalHand(myAfter).score - evalHand(myBefore).score)
-            + (evalHand(oppBefore).score - evalHand(oppAfter).score)
-            + colPotential(myAfter) - colPotential(myBefore)
-            + Math.random() * 5;
-    if (val > bestVal) { bestVal = val; best = c; }
+    aS += evalHand(boards.a[c]).score; pS += evalHand(boards.p[c]).score;
+    aP += colPotential(boards.a[c]);   pP += colPotential(boards.p[c]);
+    filled += boards.a[c].length + boards.p[c].length;
+  }
+  const prog = filled / 18; // 0 (empty) → 1 (both boards full)
+  let aExp = 0, pExp = 0;
+  for (let c = 0; c < 3; c++) {
+    if (boards.p[c].length < 3) aExp += smashRisk(boards.a[c]);
+    if (boards.a[c].length < 3) pExp += smashRisk(boards.p[c]);
+  }
+  return (aS - pS) + (1 - prog) * 0.6 * (aP - pP) - prog * 0.4 * (aExp - pExp);
+}
+
+// `side` has drawn `card` and must place it; search `depth` plies. Dealer
+// maximises, opponent minimises, draws are chance nodes averaged uniformly
+// over the drawing side's remaining deck.
+function searchPlace(boards, decks, side, card, depth) {
+  const opp = side === "a" ? "p" : "a";
+  let best = side === "a" ? -Infinity : Infinity, any = false;
+  for (let col = 0; col < 3; col++) {
+    if (boards[side][col].length >= 3) continue;
+    any = true;
+    const nb = applyPlace(boards, side, col, card);
+    let v;
+    if (depth <= 1 || boardFull(nb, "a") || boardFull(nb, "p")) {
+      v = leafEval(nb);
+    } else {
+      const od = decks[opp];
+      if (!od.length) { v = leafEval(nb); }
+      else {
+        let sum = 0;
+        for (const dc of od) sum += searchPlace(nb, decks, opp, dc, depth - 1);
+        v = sum / od.length;
+      }
+    }
+    if (side === "a") { if (v > best) best = v; }
+    else { if (v < best) best = v; }
+  }
+  return any ? best : leafEval(boards);
+}
+
+function aiChoose(g) {
+  const { drawn: card, boards, decks } = g;
+  let best = -1, bestVal = -Infinity;
+  for (let col = 0; col < 3; col++) {
+    if (boards.a[col].length >= 3) continue;
+    const nb = applyPlace(boards, "a", col, card);
+    let v;
+    if (AI_DEPTH <= 1 || boardFull(nb, "a") || boardFull(nb, "p") || !decks.p.length) {
+      v = leafEval(nb);
+    } else {
+      let sum = 0;
+      for (const dc of decks.p) sum += searchPlace(nb, decks, "p", dc, AI_DEPTH - 1);
+      v = sum / decks.p.length;
+    }
+    if (v > bestVal) { bestVal = v; best = col; } // ties break to lower column
   }
   return best;
 }
@@ -157,8 +242,10 @@ function App() {
   const [handFx, setHandFx] = useState(null);
   const HAND_TIER = { 2: 1, 3: 2, 4: 3, 6: 4, 12: 5 };
   const [showRules, setShowRules] = useState(false);
+  const [deckView, setDeckView] = useState(null); // "p" | "a" | null
   const starterRef = useRef(Math.random() < 0.5 ? "p" : "a");
-  const deckRef = useRef(null);
+  const pDeckRef = useRef(null);
+  const aDeckRef = useRef(null);
   const timeouts = useRef([]);
   const later = (fn, ms) => timeouts.current.push(setTimeout(fn, ms));
   useEffect(() => () => timeouts.current.forEach(clearTimeout), []);
@@ -167,11 +254,11 @@ function App() {
   function deal(b) {
     if (b < 1 || b > bank) return;
     setBank(v => +(v - b).toFixed(2));
-    const deck = makeDeck();
+    const decks = { p: makeDeck(), a: makeDeck() };
     const starter = starterRef.current;
     starterRef.current = starter === "p" ? "a" : "p";
-    const drawn = deck.pop();
-    setG({ deck, drawn, turn: starter, boards: { p: [[], [], []], a: [[], [], []] }, dying: [], bet: b });
+    const drawn = decks[starter].pop();
+    setG({ decks, drawn, turn: starter, boards: { p: [[], [], []], a: [[], [], []] }, dying: [], bet: b });
     setResult(null);
     setHandFx(null);
     setPhase("play");
@@ -221,10 +308,10 @@ function App() {
         a: g2.boards.a.map(cl => cl.filter(c => !victims.includes(c.id))),
       };
       const full = s => nb[s].every(cl => cl.length === 3);
-      if (full("p") || full("a") || g2.deck.length === 0) { endGame(nb); return; }
-      const deck = [...g2.deck];
-      const drawn = deck.pop();
-      setG({ ...g2, boards: nb, dying: [], deck, drawn, turn: opp });
+      if (full("p") || full("a") || g2.decks[opp].length === 0) { endGame(nb); return; }
+      const decks = { p: [...g2.decks.p], a: [...g2.decks.a] };
+      const drawn = decks[opp].pop();
+      setG({ ...g2, boards: nb, dying: [], decks, drawn, turn: opp });
       setBusy2(false);
       if (opp === "a") later(aiMove, 1500);
     }, victims.length ? 750 : 380);
@@ -265,11 +352,17 @@ function App() {
         <span className="bank">{fmt(bank)}</span>
       </header>
 
-      <div className={"scoreline" + (aTotal > pTotal ? " lead" : "")}>
-        <span>DEALER</span>
+      <div className={"scoreline strip" + (aTotal > pTotal ? " lead" : "")}>
+        <div className="deck sm" onClick={g ? () => setDeckView("a") : undefined}>
+          <div ref={aDeckRef}
+            className={"deckpile sm" + (g && g.drawn && g.turn === "a" ? " drew" : "")}
+            key={g && g.drawn && g.turn === "a" ? "da" + g.drawn.id : "aidle"} />
+          <span>{g ? g.decks.a.length : 52}</span>
+        </div>
+        <span className="who">DEALER</span>
         <div className="dealerdraw">
           {g && g.drawn && g.turn === "a"
-            ? <DrawnCard key={g.drawn.id} c={g.drawn} deckRef={deckRef} small />
+            ? <DrawnCard key={g.drawn.id} c={g.drawn} deckRef={aDeckRef} small />
             : <div className="slot dsm" />}
         </div>
         <b>{aTotal}</b>
@@ -325,15 +418,15 @@ function App() {
       </div>
 
       <div className="center">
-        <div className="deck">
-          <div ref={deckRef}
-            className={"deckpile" + (g && g.drawn ? " drew" : "")}
-            key={g && g.drawn ? "d" + g.drawn.id : "idle"} />
-          <span>{g ? g.deck.length : 52}</span>
+        <div className="deck" onClick={g ? () => setDeckView("p") : undefined}>
+          <div ref={pDeckRef}
+            className={"deckpile" + (g && g.drawn && g.turn === "p" ? " drew" : "")}
+            key={g && g.drawn && g.turn === "p" ? "dp" + g.drawn.id : "pidle"} />
+          <span>{g ? g.decks.p.length : 52}</span>
         </div>
         <div className="drawzone">
           {g && g.drawn && g.turn === "p"
-            ? <DrawnCard key={g.drawn.id} c={g.drawn} deckRef={deckRef} />
+            ? <DrawnCard key={g.drawn.id} c={g.drawn} deckRef={pDeckRef} />
             : <div className="slot big" />}
           <div className={"turnmsg" + (playerTurn ? " mine" : "")}>
             {phase !== "play" ? "PLACE YOUR BET"
@@ -404,9 +497,10 @@ function App() {
         <div className="overlay dim" onClick={() => setShowRules(false)}>
           <div className="panel rules" onClick={e => e.stopPropagation()}>
             <h2>HOW TO PLAY</h2>
-            <p>You and the dealer share one 52-card deck and take turns. On your
-            turn, a card is drawn — tap one of your three columns to place it.
-            Each column faces the dealer's column directly above it.</p>
+            <p>You and the dealer each draw from your own 52-card deck and take
+            turns. On your turn, a card is drawn — tap one of your three columns
+            to place it. Each column faces the dealer's column directly above it.
+            Tap either deck to see the cards it has left.</p>
             <p><b className="gold">Destruction:</b> placing a card destroys every card of the
             <b> same rank</b> in the dealer's opposing column — and the dealer
             can do the same to you. Pairs score big, but they're a target.</p>
@@ -426,6 +520,44 @@ function App() {
           </div>
         </div>
       )}
+
+      {deckView && g && (
+        <div className="overlay dim" onClick={() => setDeckView(null)}>
+          <div className="panel deckbreak" onClick={e => e.stopPropagation()}>
+            <h2>{deckView === "a" ? "DEALER'S" : "YOUR"} DECK</h2>
+            <p className="bankline">{g.decks[deckView].length} CARDS REMAINING</p>
+            <DeckBreakdown cards={g.decks[deckView]} />
+            <button className="dealbtn" onClick={() => setDeckView(null)}>CLOSE</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Breakdown of cards still in a deck, one row per rank (high → low),
+// showing which suits remain and a per-rank count.
+function DeckBreakdown({ cards }) {
+  const byRank = {};
+  cards.forEach(c => { (byRank[c.r] = byRank[c.r] || []).push(c.s); });
+  const ranks = [];
+  for (let r = 14; r >= 2; r--) ranks.push(r);
+  return (
+    <div className="breakgrid">
+      {ranks.map(r => {
+        const have = byRank[r] || [];
+        return (
+          <div key={r} className="brow">
+            <span className="brank">{rName(r)}</span>
+            <span className="bsuits">
+              {SUITS.map(s => (
+                <span key={s} className={"bs" + (isRed(s) ? " red" : "") + (have.includes(s) ? "" : " gone")}>{s}</span>
+              ))}
+            </span>
+            <span className="bcount">{have.length}</span>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -561,6 +693,12 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 }
 .dealerdraw { display: flex; justify-content: center; }
 .slot.dsm { width: 36px; aspect-ratio: 5 / 7; height: auto; }
+.scoreline.strip {
+  max-width: 360px;
+  gap: 10px;
+  padding: 2px 6px;
+}
+.scoreline.strip .who { flex: 1; }
 
 .field {
   display: flex;
@@ -738,6 +876,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
   gap: 2px;
   color: var(--muted);
   font-size: 11px;
+  cursor: pointer;
 }
 .deckpile {
   width: 34px;
@@ -746,6 +885,12 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
   border: 2px solid #3a5a46;
   background: repeating-linear-gradient(45deg, #16271d 0 4px, #1d3327 4px 8px);
   box-shadow: 2px 2px 0 #0d1710, 4px 4px 0 #0a110c;
+}
+.deck.sm { font-size: 10px; }
+.deckpile.sm {
+  width: 26px;
+  height: 36px;
+  box-shadow: 1px 1px 0 #0d1710, 2px 2px 0 #0a110c;
 }
 .deckpile.drew { animation: decknudge .3s ease-out; }
 @keyframes decknudge {
@@ -983,6 +1128,43 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 }
 .rules td { padding: 3px 6px; border-bottom: 1px solid #1b2a20; }
 .rules td:last-child { text-align: right; color: var(--gold); font-weight: 600; }
+
+/* ─── DECK BREAKDOWN ─── */
+.deckbreak { max-height: 88dvh; overflow-y: auto; }
+.deckbreak .bankline { margin-bottom: 14px; }
+.breakgrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px 14px;
+  margin-bottom: 16px;
+}
+.brow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px;
+  border-bottom: 1px solid #1b2a20;
+}
+.brank {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-weight: 700;
+  font-size: 15px;
+  width: 18px;
+  text-align: center;
+  color: var(--text);
+}
+.bsuits { display: flex; gap: 3px; flex: 1; }
+.bs { font-size: 14px; color: #cdd5cf; }
+.bs.red { color: var(--redsuit); }
+.bs.gone { opacity: .16; }
+.bcount {
+  font-family: 'Barlow Condensed', sans-serif;
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--gold);
+  width: 14px;
+  text-align: right;
+}
 </style>
 </body>
 </html>
