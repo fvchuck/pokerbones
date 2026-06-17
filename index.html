@@ -287,6 +287,50 @@ function RotateCcw() {
   );
 }
 
+// True on landscape, reasonably wide viewports (desktop + tablets in landscape).
+// Phones and portrait tablets stay on the original vertical layout.
+function useIsWide() {
+  const Q = "(min-width: 900px) and (min-aspect-ratio: 1/1)";
+  const [wide, setWide] = useState(() =>
+    typeof window !== "undefined" && window.matchMedia(Q).matches);
+  useEffect(() => {
+    const mq = window.matchMedia(Q);
+    const on = e => setWide(e.matches);
+    mq.addEventListener("change", on);
+    setWide(mq.matches);
+    return () => mq.removeEventListener("change", on);
+  }, []);
+  return wide;
+}
+
+// Desktop total: a medallion the three column scores "pour" into via funnel
+// lines, so total = A + B + C reads at a glance. side is "en" (dealer) | "you".
+function DFunnel({ side, total, winning }) {
+  const my = side === "en" ? 34 : 50;   // medallion edge y
+  const cy = side === "en" ? 82 : 32;   // columns edge y
+  const xs = [16.6, 50, 83.3];
+  return (
+    <div className={"dfunnel " + side + (winning ? " win" : "")}>
+      <svg className="dfsvg" viewBox="0 0 100 84" preserveAspectRatio="none" aria-hidden="true">
+        {xs.map((x, i) => (
+          <React.Fragment key={i}>
+            <line x1="50" y1={my} x2={x} y2={cy} stroke="#c99a3a" strokeWidth="2.5" vectorEffect="non-scaling-stroke" />
+            <circle cx={x} cy={cy} r="2.4" fill="#f4c64e" />
+          </React.Fragment>
+        ))}
+      </svg>
+      <div className="dtotwrap">
+        <span className="dmk">{side === "en" ? "DEALER TOTAL" : "YOUR TOTAL"}</span>
+        <div className="dmedalwrap">
+          {winning && <span className="sunrays" aria-hidden="true" />}
+          {winning && <span className="crown">{CROWN}</span>}
+          <div className="dmedal"><b>{total}</b></div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const [bank, setBank] = useState(() => {
     const v = parseFloat(localStorage.getItem("pokerbones_bank"));
@@ -342,7 +386,7 @@ function App() {
     const decks = { p: makeDeck(), a: makeDeck() };
     const starter = "p"; // player always acts first (RTP balanced via payout, see COMMISSION)
     const drawn = decks[starter].pop();
-    setG({ decks, drawn, turn: starter, boards: { p: [[], [], []], a: [[], [], []] }, dying: [], bet: b });
+    setG({ decks, drawn, turn: starter, boards: { p: [[], [], []], a: [[], [], []] }, dying: [], bet: b, flips: 0 });
     setResult(null);
     setHandFx(null);
     setCelebrate(null);
@@ -383,7 +427,7 @@ function App() {
     const drawEl = document.querySelector(".drawfly");
     placeFromRef.current = drawEl ? { id: card.id, rect: drawEl.getBoundingClientRect() } : null;
     setBusy2(true);
-    setG({ ...gg, drawn: null, boards, dying: [] });
+    setG({ ...gg, drawn: null, boards, dying: [], flips: (gg.flips || 0) + 1 });
 
     // ── deferred placement payoff (runs only AFTER the attack + hand break) ──
     const playPlacement = () => {
@@ -516,6 +560,9 @@ function App() {
 
   const aWinning = aTotal > pTotal, pWinning = pTotal > aTotal;
   const stake = g && phase === "play" ? g.bet : bet;
+  // 1 round = both players have flipped once (player flips first). flips counts
+  // completed placements, so round = ⌊flips / 2⌋ + 1.
+  const round = Math.floor((g && g.flips || 0) / 2) + 1;
   const roleOf = id => !attack ? null
     : (attack.attackerId === id ? "attacker" : (attack.victims.includes(id) ? "victim" : "bystander"));
   const renderCard = (card, key) => card
@@ -533,112 +580,13 @@ function App() {
     aFx: handFx && handFx.side === "a" && handFx.col === c,
     pFx: handFx && handFx.side === "p" && handFx.col === c,
   }));
-  return (
-    <div className={"app" + (handFx && handFx.tier >= 4 ? " shake" : "")}
-      style={{ "--card-back": "url(" + CARD_BACK + ")" }}>
-      <header className="top">
-        <span className="logo">POKER<em>BONES</em></span>
-        <button className="info gear" onClick={() => setShowSettings(true)} aria-label="Settings">⚙</button>
-        <button className="info" onClick={() => setShowRules(true)}>?</button>
-        <span className="bank" ref={bankRef}>{fmt(bank)}</span>
-      </header>
 
-      <div className={"board" + (shakeLv ? " atkshake a" + shakeLv : "")
-          + (phase === "play" && g && g.turn === "p" ? " turn-you"
-            : phase === "play" && g && g.turn === "a" ? " turn-en" : "")}>
-        {/* row 1 — dealer scores (3 columns + rail total on the right) */}
-        {cols.map(C => (
-          <div key={"es" + C.c} className={"colscore en" + (C.aEv.score > C.pEv.score ? " lead" : "")}>
-            <b>{C.aEv.score || 0}</b>
-            <span>{C.aEv.name ? C.aEv.name + " ×" + C.aEv.m : "—"}</span>
-            <span className="scoreop" aria-hidden="true">{C.c < 2 ? "+" : "="}</span>
-          </div>
-        ))}
-        <div className="railcell railscore en">
-          <Label cls="en" owner="DEALER'S" noun="SCORE" />
-          <ScoreTotal side="en" total={aTotal} winning={aWinning} />
-        </div>
+  const wide = useIsWide();
 
-        {/* row 2 — dealer cards + deck/draw rail on the right */}
-        {cols.map(C => {
-          const hit = C.aCards.some(x => dying.includes(x.id));
-          return (
-            <div key={"ah" + C.c} className={"half dealer" + (hit ? " hit" : "") + (C.aFx ? " glow t" + handFx.tier : "")}>
-              {[2, 1, 0].map(j => renderCard(C.aCards[j], "e" + j))}
-              {C.aFx && <div className={"handpop t" + handFx.tier}>{handFx.name} ×{handFx.m}</div>}
-              {/* HAND BREAK shatter disabled for now:
-              {handBreakFx && handBreakFx.col === C.c &&
-                <HandBreakPop key={"hb" + handBreakFx.name + handBreakFx.m} name={handBreakFx.name} m={handBreakFx.m} tier={handBreakFx.tier} />}
-              */}
-            </div>
-          );
-        })}
-        <div className="railcell railcards en">
-          <div className="rdd">
-            <DeckPile side="a" count={g ? g.decks.a.length : 52} deckRef={aDeckRef}
-              drew={g && g.drawn && g.turn === "a"}
-              idkey={g && g.drawn && g.turn === "a" ? "da" + g.drawn.id : "aidle"}
-              onClick={g ? () => setDeckView("a") : undefined} />
-            <div className="drawhold"><Label cls="en" owner="DEALER'S" noun="DRAW" />{drawSlot("a")}</div>
-          </div>
-        </div>
-
-        {/* row 3 — column letters */}
-        {cols.map(C => <div key={"m" + C.c} className="colmid">{COL_LETTERS[C.c]}</div>)}
-        <div className="railcell railmid" />
-
-        {/* row 4 — player cards + deck/draw rail on the right */}
-        {cols.map(C => {
-          const hit = C.pCards.some(x => dying.includes(x.id));
-          return (
-            <div key={"ph" + C.c}
-              className={"half mine" + (C.tappable ? " tappable" : "") + (hit ? " hit" : "") + (C.pFx ? " glow t" + handFx.tier : "")}
-              onClick={C.tappable ? () => onColTap(C.c) : undefined}>
-              {[0, 1, 2].map(j => renderCard(C.pCards[j], "e" + j))}
-              {C.pFx && <div className={"handpop t" + handFx.tier}>{handFx.name} ×{handFx.m}</div>}
-            </div>
-          );
-        })}
-        <div className="railcell railcards you">
-          <div className="rdd">
-            <div className="drawhold"><Label cls="you" owner="YOUR" noun="DRAW" />{drawSlot("p")}</div>
-            <DeckPile side="p" count={g ? g.decks.p.length : 52} deckRef={pDeckRef}
-              drew={g && g.drawn && g.turn === "p"}
-              idkey={g && g.drawn && g.turn === "p" ? "dp" + g.drawn.id : "pidle"}
-              onClick={g ? () => setDeckView("p") : undefined} />
-          </div>
-        </div>
-
-        {/* row 5 — player scores + rail total on the right */}
-        {cols.map(C => (
-          <div key={"ps" + C.c} className={"colscore you" + (C.pEv.score > C.aEv.score ? " lead" : "")}>
-            <b>{C.pEv.score || 0}</b>
-            <span>{C.pEv.name ? C.pEv.name + " ×" + C.pEv.m : "—"}</span>
-            <span className="scoreop" aria-hidden="true">{C.c < 2 ? "+" : "="}</span>
-          </div>
-        ))}
-        <div className="railcell railscore you">
-          <Label cls="you" owner="YOUR" noun="SCORE" />
-          <ScoreTotal side="you" total={pTotal} winning={pWinning} />
-        </div>
-      </div>
-
-      <div className="botbar">
-        <div className="botbox bet">
-          <span className="botlabel">BET</span>
-          <b>{fmt(stake)}</b>
-        </div>
-        <div className={"tapbanner" + (playerTurn ? " mine" : "")}>
-          {phase !== "play" ? "PLACE YOUR BET"
-            : playerTurn ? "YOUR DRAW — TAP A COLUMN"
-            : "DEALER'S TURN…"}
-        </div>
-        <div className="botbox payout">
-          <span className="botlabel gold">PAYOUT</span>
-          <b>{fmt(stake * (2 - COMMISSION))}</b>
-        </div>
-      </div>
-
+  // Overlays (bet slip, result, settings, rules, deck view, turn toast, win
+  // celebration) are position:fixed and identical for both layouts — share them.
+  const overlays = (
+    <React.Fragment>
       {turnToast && (
         <div key={turnToast.id} className={"turntoast " + (turnToast.side === "p" ? "you" : "en")}>
           {turnToast.text}
@@ -755,14 +703,6 @@ function App() {
         </div>
       )}
 
-      {/* Kill banners disabled for now. HAND BREAK is rendered over the defending
-          column (see the dealer-half map) as a shattering hand callout instead.
-      {killStreak && (
-        <div className="callouts">
-          <div className={"callout killstreak " + killStreak.toLowerCase()}>{killStreak} KILL!</div>
-        </div>
-      )} */}
-
       {celebrate && (
         <WinCelebration
           ret={celebrate.ret}
@@ -773,6 +713,208 @@ function App() {
           onDone={finishCelebration}
         />
       )}
+    </React.Fragment>
+  );
+
+  // ─── DESKTOP / TABLET (wide) LAYOUT ───
+  // Reuses the same .board / .half / .colscore / .handpop class names so every
+  // attack, hit, glow and turn-dimming effect works untouched; only the layout
+  // (stations on the flanks, per-column panels, funnel totals) is new.
+  if (wide) {
+    const dColumn = C => {
+      const aHit = C.aCards.some(x => dying.includes(x.id));
+      const pHit = C.pCards.some(x => dying.includes(x.id));
+      return (
+        <div key={"dc" + C.c} className="dcolumn">
+          <div className="dtab">{COL_LETTERS[C.c]}</div>
+          <div className={"colscore en" + (C.aEv.score > C.pEv.score ? " lead" : "")}>
+            <b>{C.aEv.score || 0}</b>
+            <span>{C.aEv.name ? C.aEv.name + " ×" + C.aEv.m : "—"}</span>
+          </div>
+          <div className={"half dealer" + (aHit ? " hit" : "") + (C.aFx ? " glow t" + handFx.tier : "")}>
+            {[0, 1, 2].map(j => renderCard(C.aCards[j], "e" + j))}
+            {C.aFx && <div className={"handpop t" + handFx.tier}>{handFx.name} ×{handFx.m}</div>}
+          </div>
+          <div className="ddiv" aria-hidden="true" />
+          <div className={"half mine" + (C.tappable ? " tappable" : "") + (pHit ? " hit" : "") + (C.pFx ? " glow t" + handFx.tier : "")}
+            onClick={C.tappable ? () => onColTap(C.c) : undefined}>
+            {[0, 1, 2].map(j => renderCard(C.pCards[j], "e" + j))}
+            {C.pFx && <div className={"handpop t" + handFx.tier}>{handFx.name} ×{handFx.m}</div>}
+          </div>
+          <div className={"colscore you" + (C.pEv.score > C.aEv.score ? " lead" : "")}>
+            <b>{C.pEv.score || 0}</b>
+            <span>{C.pEv.name ? C.pEv.name + " ×" + C.pEv.m : "—"}</span>
+          </div>
+        </div>
+      );
+    };
+    return (
+      <React.Fragment>
+        <div className={"deskapp" + (handFx && handFx.tier >= 4 ? " shake" : "")}
+          style={{ "--card-back": "url(" + CARD_BACK + ")" }}>
+          <header className="dtop">
+            <span className="logo dlogo">POKER<em>BONES</em></span>
+            <div className="roundpill">ROUND&nbsp;{round}</div>
+            <span className="bank dbank" ref={bankRef}>{fmt(bank)}</span>
+            <button className="info gear" onClick={() => setShowSettings(true)} aria-label="Settings">⚙</button>
+            <button className="info" onClick={() => setShowRules(true)}>?</button>
+          </header>
+
+          <div className={"board deskboard" + (shakeLv ? " atkshake a" + shakeLv : "")
+              + (phase === "play" && g && g.turn === "p" ? " turn-you"
+                : phase === "play" && g && g.turn === "a" ? " turn-en" : "")}>
+
+            <div className="dstation en">
+              <div className="dsthead en">DEALER</div>
+              <div className="dstbody">
+                <div className="drawhold"><Label cls="en" owner="DEALER'S" noun="DRAW" />{drawSlot("a")}</div>
+                <DeckPile side="a" count={g ? g.decks.a.length : 52} deckRef={aDeckRef}
+                  drew={g && g.drawn && g.turn === "a"}
+                  idkey={g && g.drawn && g.turn === "a" ? "da" + g.drawn.id : "aidle"}
+                  onClick={g ? () => setDeckView("a") : undefined} />
+              </div>
+            </div>
+
+            <div className="dcenter">
+              <DFunnel side="en" total={aTotal} winning={aWinning} />
+              <div className="dcols">{cols.map(dColumn)}</div>
+              <DFunnel side="you" total={pTotal} winning={pWinning} />
+            </div>
+
+            <div className="dstation you">
+              <div className="dsthead you">YOU</div>
+              <div className="dstbody">
+                <div className="drawhold"><Label cls="you" owner="YOUR" noun="DRAW" />{drawSlot("p")}</div>
+                <DeckPile side="p" count={g ? g.decks.p.length : 52} deckRef={pDeckRef}
+                  drew={g && g.drawn && g.turn === "p"}
+                  idkey={g && g.drawn && g.turn === "p" ? "dp" + g.drawn.id : "pidle"}
+                  onClick={g ? () => setDeckView("p") : undefined} />
+              </div>
+            </div>
+          </div>
+
+          <div className="dbot">
+            <div className="botbox bet"><span className="botlabel">BET</span><b>{fmt(stake)}</b></div>
+            <div className={"tapbanner" + (playerTurn ? " mine" : "")}>
+              {phase !== "play" ? "PLACE YOUR BET"
+                : playerTurn ? "YOUR DRAW — CHOOSE A COLUMN"
+                : "DEALER'S TURN…"}
+            </div>
+            <div className="botbox payout"><span className="botlabel gold">PAYOUT</span><b>{fmt(stake * (2 - COMMISSION))}</b></div>
+          </div>
+        </div>
+        {overlays}
+      </React.Fragment>
+    );
+  }
+
+  return (
+    <div className={"app" + (handFx && handFx.tier >= 4 ? " shake" : "")}
+      style={{ "--card-back": "url(" + CARD_BACK + ")" }}>
+      <header className="top">
+        <span className="logo">POKER<em>BONES</em></span>
+        <button className="info gear" onClick={() => setShowSettings(true)} aria-label="Settings">⚙</button>
+        <button className="info" onClick={() => setShowRules(true)}>?</button>
+        <span className="bank" ref={bankRef}>{fmt(bank)}</span>
+      </header>
+
+      <div className={"board" + (shakeLv ? " atkshake a" + shakeLv : "")
+          + (phase === "play" && g && g.turn === "p" ? " turn-you"
+            : phase === "play" && g && g.turn === "a" ? " turn-en" : "")}>
+        {/* row 1 — dealer scores (3 columns + rail total on the right) */}
+        {cols.map(C => (
+          <div key={"es" + C.c} className={"colscore en" + (C.aEv.score > C.pEv.score ? " lead" : "")}>
+            <b>{C.aEv.score || 0}</b>
+            <span>{C.aEv.name ? C.aEv.name + " ×" + C.aEv.m : "—"}</span>
+            <span className="scoreop" aria-hidden="true">{C.c < 2 ? "+" : "="}</span>
+          </div>
+        ))}
+        <div className="railcell railscore en">
+          <Label cls="en" owner="DEALER'S" noun="SCORE" />
+          <ScoreTotal side="en" total={aTotal} winning={aWinning} />
+        </div>
+
+        {/* row 2 — dealer cards + deck/draw rail on the right */}
+        {cols.map(C => {
+          const hit = C.aCards.some(x => dying.includes(x.id));
+          return (
+            <div key={"ah" + C.c} className={"half dealer" + (hit ? " hit" : "") + (C.aFx ? " glow t" + handFx.tier : "")}>
+              {[2, 1, 0].map(j => renderCard(C.aCards[j], "e" + j))}
+              {C.aFx && <div className={"handpop t" + handFx.tier}>{handFx.name} ×{handFx.m}</div>}
+              {/* HAND BREAK shatter disabled for now:
+              {handBreakFx && handBreakFx.col === C.c &&
+                <HandBreakPop key={"hb" + handBreakFx.name + handBreakFx.m} name={handBreakFx.name} m={handBreakFx.m} tier={handBreakFx.tier} />}
+              */}
+            </div>
+          );
+        })}
+        <div className="railcell railcards en">
+          <div className="rdd">
+            <DeckPile side="a" count={g ? g.decks.a.length : 52} deckRef={aDeckRef}
+              drew={g && g.drawn && g.turn === "a"}
+              idkey={g && g.drawn && g.turn === "a" ? "da" + g.drawn.id : "aidle"}
+              onClick={g ? () => setDeckView("a") : undefined} />
+            <div className="drawhold"><Label cls="en" owner="DEALER'S" noun="DRAW" />{drawSlot("a")}</div>
+          </div>
+        </div>
+
+        {/* row 3 — column letters */}
+        {cols.map(C => <div key={"m" + C.c} className="colmid">{COL_LETTERS[C.c]}</div>)}
+        <div className="railcell railmid" />
+
+        {/* row 4 — player cards + deck/draw rail on the right */}
+        {cols.map(C => {
+          const hit = C.pCards.some(x => dying.includes(x.id));
+          return (
+            <div key={"ph" + C.c}
+              className={"half mine" + (C.tappable ? " tappable" : "") + (hit ? " hit" : "") + (C.pFx ? " glow t" + handFx.tier : "")}
+              onClick={C.tappable ? () => onColTap(C.c) : undefined}>
+              {[0, 1, 2].map(j => renderCard(C.pCards[j], "e" + j))}
+              {C.pFx && <div className={"handpop t" + handFx.tier}>{handFx.name} ×{handFx.m}</div>}
+            </div>
+          );
+        })}
+        <div className="railcell railcards you">
+          <div className="rdd">
+            <div className="drawhold"><Label cls="you" owner="YOUR" noun="DRAW" />{drawSlot("p")}</div>
+            <DeckPile side="p" count={g ? g.decks.p.length : 52} deckRef={pDeckRef}
+              drew={g && g.drawn && g.turn === "p"}
+              idkey={g && g.drawn && g.turn === "p" ? "dp" + g.drawn.id : "pidle"}
+              onClick={g ? () => setDeckView("p") : undefined} />
+          </div>
+        </div>
+
+        {/* row 5 — player scores + rail total on the right */}
+        {cols.map(C => (
+          <div key={"ps" + C.c} className={"colscore you" + (C.pEv.score > C.aEv.score ? " lead" : "")}>
+            <b>{C.pEv.score || 0}</b>
+            <span>{C.pEv.name ? C.pEv.name + " ×" + C.pEv.m : "—"}</span>
+            <span className="scoreop" aria-hidden="true">{C.c < 2 ? "+" : "="}</span>
+          </div>
+        ))}
+        <div className="railcell railscore you">
+          <Label cls="you" owner="YOUR" noun="SCORE" />
+          <ScoreTotal side="you" total={pTotal} winning={pWinning} />
+        </div>
+      </div>
+
+      <div className="botbar">
+        <div className="botbox bet">
+          <span className="botlabel">BET</span>
+          <b>{fmt(stake)}</b>
+        </div>
+        <div className={"tapbanner" + (playerTurn ? " mine" : "")}>
+          {phase !== "play" ? "PLACE YOUR BET"
+            : playerTurn ? "YOUR DRAW — TAP A COLUMN"
+            : "DEALER'S TURN…"}
+        </div>
+        <div className="botbox payout">
+          <span className="botlabel gold">PAYOUT</span>
+          <b>{fmt(stake * (2 - COMMISSION))}</b>
+        </div>
+      </div>
+
+      {overlays}
     </div>
   );
 }
@@ -1249,6 +1391,19 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
   background-color: #14304a;
 }
 .pcard.top { box-shadow: 0 4px 10px rgba(0,0,0,.55); }
+/* our own red (dealer) / blue (you) striped card backs */
+.deckpile.a .pcard {
+  background:
+    repeating-linear-gradient(45deg, rgba(0,0,0,.20) 0 6px, transparent 6px 12px),
+    linear-gradient(135deg, #8a2c22, #5a1c16);
+  border: 2px solid #e8c98a;
+}
+.deckpile.p .pcard {
+  background:
+    repeating-linear-gradient(45deg, rgba(255,255,255,.12) 0 6px, transparent 6px 12px),
+    linear-gradient(135deg, #1f4e78, #102b45);
+  border: 2px solid #cfe0ef;
+}
 .deckpile.drew .pcard.top { animation: decknudge .3s ease-out; }
 @keyframes decknudge {
   0%   { transform: translate(0,0) rotate(0); }
@@ -1766,10 +1921,20 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 .face.front .cs { position: absolute; bottom: 7%; right: 9%; line-height: .8; font-size: calc(var(--drawh) * 0.5328); }
 .face.back {
   transform: rotateY(180deg);
-  background-image: var(--card-back);
-  background-size: cover; background-position: center; background-repeat: no-repeat;
-  background-color: #14304a;
   box-shadow: 0 3px 7px rgba(0,0,0,.5);
+}
+/* our own red (dealer) / blue (you) striped card backs */
+.face.back.en {
+  background:
+    repeating-linear-gradient(45deg, rgba(0,0,0,.20) 0 6px, transparent 6px 12px),
+    linear-gradient(135deg, #8a2c22, #5a1c16);
+  border: 2px solid #e8c98a;
+}
+.face.back.you {
+  background:
+    repeating-linear-gradient(45deg, rgba(255,255,255,.12) 0 6px, transparent 6px 12px),
+    linear-gradient(135deg, #1f4e78, #102b45);
+  border: 2px solid #cfe0ef;
 }
 
 /* ─── OVERLAYS ─── */
@@ -2073,6 +2238,114 @@ ReactDOM.createRoot(document.getElementById("root")).render(<App />);
   18%  { transform: translate(calc(-50% + var(--jx)), -75%) scale(1.15); opacity: 1; }
   100% { transform: translate(calc(-50% + var(--cx)), calc(-50% + var(--cy))) scale(.35); opacity: 0; }
 }
+
+/* ════════════════════ DESKTOP / TABLET (wide) LAYOUT ════════════════════
+   Reuses .board / .half / .colscore / .handpop / .deck so every animation
+   carries over; only the arrangement is new. Activated by useIsWide(). */
+.deskapp {
+  width: 100%; max-width: 1520px; min-height: 100dvh; margin: 0 auto;
+  /* own stacking context (transparent bg) so the z-index:-1 sunrays sit ABOVE
+     the felt background but BEHIND all the app content */
+  position: relative; isolation: isolate;
+  display: flex; flex-direction: column;
+  padding: 12px clamp(14px,2vw,28px) calc(env(safe-area-inset-bottom) + 12px);
+  font-family: 'Barlow', sans-serif; color: var(--text);
+  user-select: none; -webkit-user-select: none;
+  /* one card size for everything — column cards == deck/draw cards. width-based
+     so 3 cards × 3 columns + 2 stations always fit across; height follows 5:7. */
+  --cardw: clamp(50px, 5.9vw, 92px);  --cardh: calc(var(--cardw) / 0.72);
+  --drawh: var(--cardh);              --draww: var(--cardw);
+  --scoreh: clamp(44px, 7dvh, 64px);
+}
+.deskapp.shake { animation: shake .5s ease-out; }
+
+.dtop { position: relative; z-index: 3; display: flex; align-items: center; gap: 16px; padding: 2px; margin-bottom: 10px; }
+.dlogo { margin-right: auto; }
+.roundpill { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  display: flex; align-items: center; gap: 9px;
+  padding: 8px 22px; border: 1px solid rgba(255,255,255,.14); border-radius: 10px;
+  background: rgba(0,0,0,.28); font-family: var(--cf); font-weight: 600;
+  letter-spacing: 2px; font-size: clamp(13px,1.3vw,16px); color: #cdddd4; }
+
+/* board → three zones: dealer station · center · you station */
+.board.deskboard {
+  flex: 1; display: grid;
+  grid-template-columns: clamp(108px,11.5vw,200px) 1fr clamp(108px,11.5vw,200px);
+  grid-template-rows: none; gap: clamp(12px,1.6vw,20px);
+  align-items: stretch; justify-content: stretch; padding: 0;
+}
+
+.dstation { border-radius: 14px; overflow: hidden; display: flex; flex-direction: column;
+  box-shadow: 0 8px 24px rgba(0,0,0,.35), inset 0 0 40px rgba(0,0,0,.22); }
+.dstation.en  { background: linear-gradient(180deg,#4a1a18,#2a0f0e); border: 1px solid #7a3029; }
+.dstation.you { background: linear-gradient(180deg,#15324f,#0c1f33); border: 1px solid #2d5a82; }
+.dsthead { font-family: var(--cf); font-weight: 700; font-size: clamp(18px,1.5vw,23px);
+  letter-spacing: 2px; text-align: center; padding: 10px; background: rgba(0,0,0,.25); }
+.dsthead.en  { border-bottom: 1px solid rgba(255,120,90,.25); }
+.dsthead.you { border-bottom: 1px solid rgba(90,166,224,.3); }
+.dstbody { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: clamp(10px,1.6dvh,18px); padding: 16px; }
+.dstbody .deck, .dstbody .drawhold { gap: 6px; }
+
+.dcenter { position: relative; display: flex; flex-direction: column; justify-content: center; gap: clamp(4px,0.8dvh,10px); min-width: 0; }
+/* columns sit ABOVE the funnel sunrays so the rays only shine behind them.
+   extra top margin keeps the dealer total clear of the column letter tabs. */
+.dcols { position: relative; z-index: 1; display: flex; gap: clamp(12px,1.6vw,20px);
+  align-items: stretch; margin-top: clamp(16px,2.2dvh,24px); }
+
+.dcolumn { position: relative; flex: 1; min-width: 0;
+  display: flex; flex-direction: column; align-items: center; gap: clamp(5px,0.8dvh,11px);
+  padding: clamp(13px,1.5dvh,19px) clamp(8px,1vw,14px) clamp(9px,1.1dvh,15px);
+  border: 1px solid rgba(120,180,160,.28); border-radius: 16px;
+  background: linear-gradient(180deg, rgba(90,34,28,.20) 0 50%, rgba(23,58,92,.18) 50% 100%);
+  box-shadow: 0 8px 22px rgba(0,0,0,.28); }
+.dtab { position: absolute; top: -16px; left: 50%; transform: translateX(-50%);
+  width: 74px; height: 34px; background: linear-gradient(180deg,#143f37,#0b2a24);
+  border: 1px solid rgba(120,180,160,.45); border-bottom: none;
+  clip-path: polygon(8% 0,92% 0,100% 55%,50% 100%,0 55%);
+  display: flex; align-items: flex-start; justify-content: center; padding-top: 3px;
+  font-family: var(--cf); font-weight: 700; font-size: 21px; color: var(--gold); }
+
+/* desktop card rows run horizontally (portrait stacks them vertically) */
+.deskapp .half { flex-direction: row; width: auto; gap: clamp(5px,0.7vw,10px);
+  padding: clamp(5px,0.7dvh,9px); border-radius: 11px; }
+.deskapp .colscore { height: auto; min-height: var(--scoreh); width: 100%; }
+.deskapp .colscore .scoreop { display: none; }
+.deskapp .colscore span { font-size: clamp(15px,1.7vw,23px); margin-top: 2px; }
+
+.ddiv { position: relative; width: 84%; height: 0; border-top: 2px solid var(--gold-dim); margin: 1px 0; }
+.ddiv::after { content: ""; position: absolute; left: 50%; top: 50%;
+  transform: translate(-50%,-50%) rotate(45deg); width: 11px; height: 11px;
+  background: var(--gold); box-shadow: 0 0 8px rgba(244,198,76,.5); }
+
+.dfunnel { position: relative; height: clamp(80px,11dvh,98px); }
+.dfunnel .dfsvg { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .85; }
+/* centre without transform — a transform here would create a stacking context
+   that traps the sunrays and stops them sitting behind the rest of the UI */
+.dfunnel .dtotwrap { position: absolute; left: 50%; margin-left: calc(clamp(150px,15vw,178px) * -0.5);
+  width: clamp(150px,15vw,178px); display: flex; flex-direction: column; align-items: center; }
+.dfunnel.en  .dtotwrap { top: 0; }
+.dfunnel.you .dtotwrap { bottom: 0; }
+/* sunrays sit on a negative layer so they shine BEHIND every other element;
+   width 124% (vs the mobile 207%) makes the rays ~40% shorter */
+.dfunnel .sunrays { z-index: -1; width: 124%; }
+/* label sits just on top of the box (no layout shift when the crown appears) */
+.dfunnel .dmk { display: block; font-family: var(--cf); font-weight: 700; font-size: clamp(13px,1.2vw,17px);
+  letter-spacing: 2px; color: var(--gold-soft); margin-bottom: 3px; }
+.dfunnel .dmedalwrap { position: relative; width: 100%; display: flex; justify-content: center; }
+/* tall box — the number is centred, leaving room at the top for the crown (mobile-style) */
+.dfunnel .dmedal { position: relative; z-index: 1; width: 100%; height: clamp(58px,8dvh,74px);
+  display: flex; align-items: center; justify-content: center; padding: 0 12px;
+  background: #0f2c1f; border: 2px solid var(--gold); border-radius: 13px;
+  box-shadow: 0 0 18px rgba(244,198,78,.22); }
+.dfunnel .dmedal b { font-family: var(--cf); font-weight: 700; font-size: clamp(24px,2.6vw,36px); line-height: .85; color: var(--gold); }
+.dfunnel.win .dmedal { box-shadow: 0 0 26px rgba(244,198,78,.5); border-color: var(--gold-soft); }
+/* crown perches inside the box's top space — same as the mobile total */
+.dfunnel .crown { width: clamp(20px,2.2vw,26px); bottom: auto; top: 2px; margin-bottom: 0; }
+
+.dbot { display: flex; align-items: stretch; gap: clamp(8px,1.4vw,16px); padding: 12px 0 6px; }
+.dbot .botbox { min-width: clamp(96px,9vw,130px); }
+.dbot .tapbanner { font-size: clamp(18px,2vw,28px); }
 </style>
 </body>
 </html>
